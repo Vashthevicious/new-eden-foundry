@@ -110,6 +110,9 @@ tr.total td{border-top:2px solid var(--fg);border-bottom:none;font-weight:600;}
 tr.stepdepth td{background:var(--layer2);font-weight:600;font-family:var(--mono);font-size:11px;
   text-transform:uppercase;letter-spacing:.08em;color:var(--fg2);}
 .scroller{overflow-x:auto;}
+tr.steprow{cursor:pointer;}
+tr.steprow:hover td{background:var(--hl);}
+tr.submat td{background:var(--layer2);color:var(--fg2);font-size:12.5px;border-bottom:1px solid var(--border);}
 .ticon{width:24px;height:24px;vertical-align:middle;flex:none;background:var(--layer3);}
 .ticon.lg{width:32px;height:32px;}
 

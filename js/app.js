@@ -9,8 +9,8 @@ let TYPES={}, RECIPES={}, INVENT={}, GROUPS={}, NAME2ID={};
 const LSKEY='nef-site-v1', SSOKEY='nef-sso-v1';
 const SSO_BASE='https://login.eveonline.com/v2/oauth';
 const ESI='https://esi.evetech.net/latest';
-const SSO_SCOPES='esi-characters.read_blueprints.v1';
-let S={ targets:[], buy:{}, me:{}, stock:{}, prices:{}, manual:{},
+const SSO_SCOPES='esi-characters.read_blueprints.v1 esi-skills.read_skills.v1';
+let S={ targets:[], buy:{}, me:{}, te:{}, stock:{}, prices:{}, manual:{}, skills:{},
         set:{me:0,te:0,structM:0,structR:0,invent:false,clientId:''},
         tab:'plan', open:{}, theme:'', priceTs:0 };
 let SSO=null; // {access, refresh, exp, charId, charName}
@@ -45,9 +45,30 @@ function price(tid){
   const m=S.manual[tid]; if(m&&(m.b!=null||m.s!=null))
     return {b:m.b??m.s, s:m.s??m.b, src:'man'};
   const p=S.prices[tid]; if(p) return p;
-  const t=TYPES[tid];
-  if(t&&t.bp!=null) return {b:t.bp,s:t.bp,src:'base'};
+  // deliberately no SDE base-price fallback: those numbers are decades stale
+  // and poison totals; unpriced items stay visibly unpriced instead
   return {b:null,s:null,src:'none'};
+}
+
+/* ---------- character skills ---------- */
+const SK={industry:3380,advIndustry:3388,reactions:45746,
+          massProd:3387,advMassProd:24625,massReact:45748,advMassReact:45749,
+          labOp:3406,advLabOp:24624};
+const skL=id=>S.skills[id]||0;
+function slots(){return {m:1+skL(SK.massProd)+skL(SK.advMassProd),
+                         r:1+skL(SK.massReact)+skL(SK.advMassReact),
+                         s:1+skL(SK.labOp)+skL(SK.advLabOp)};}
+function timeFactor(act){
+  if(act==='r') return 1-0.04*skL(SK.reactions);
+  return (1-0.04*skL(SK.industry))*(1-0.03*skL(SK.advIndustry));
+}
+function effProb(iv){
+  let enc=0,sci=0;
+  for(const [sid] of (iv.sk||[])){
+    const n=tname(sid);
+    if(/Encryption Methods$/.test(n)) enc=skL(sid); else sci+=skL(sid);
+  }
+  return Math.min(1, iv.prob*(1+enc/40+sci/30));
 }
 function planTypeIds(){
   const ids=new Set();
@@ -137,6 +158,7 @@ async function ssoCallback(){
     applyToken(j);
     toast('Logged in as '+SSO.charName);
     await pullBlueprints();
+    await pullSkills();
   }catch(e){toast('SSO login failed: '+e.message);}
   return true;
 }
@@ -166,12 +188,28 @@ async function pullBlueprints(){
         const pid=bp2prod[b.type_id];
         if(pid==null||b.material_efficiency==null)continue;
         if(S.me[pid]==null||b.material_efficiency>S.me[pid]){S.me[pid]=b.material_efficiency;n++;}
+        if(b.time_efficiency!=null&&(S.te[pid]==null||b.time_efficiency>S.te[pid]))S.te[pid]=b.time_efficiency;
       }
       page++;
     }
     toast('Applied ME from '+n+' of your blueprints');
     save();render();
   }catch(e){toast('Blueprint fetch failed: '+e.message);}
+}
+async function pullSkills(){
+  const tok=await ssoAccess();
+  if(!tok){toast('Log in with EVE first');return;}
+  try{
+    const r=await fetch(ESI+'/characters/'+SSO.charId+'/skills/',
+      {headers:{Authorization:'Bearer '+tok}});
+    if(!r.ok)throw new Error('http '+r.status+(r.status===403?' — add the esi-skills.read_skills.v1 scope to your ESI app and log in again':''));
+    const j=await r.json();
+    S.skills={};
+    for(const s of j.skills)S.skills[s.skill_id]=s.active_skill_level;
+    const sl=slots();
+    toast('Skills synced — '+sl.m+' mfg / '+sl.r+' reaction slots, times and invention odds updated');
+    save();render();
+  }catch(e){toast('Skill fetch failed: '+e.message);}
 }
 function ssoLogout(){SSO=null;saveSSO();renderReadouts();render();toast('Logged out');}
 
@@ -180,7 +218,15 @@ function meFor(tid){
   if(S.me[tid]!=null) return S.me[tid];
   const r=RECIPES[tid];
   if(r&&r.act==='r') return 0;
+  if(r&&S.set.invent&&INVENT[r.bp]) return 2;   // invented BPC base ME2
   return S.set.me;
+}
+function teFor(tid){
+  if(S.te[tid]!=null) return S.te[tid];
+  const r=RECIPES[tid];
+  if(r&&r.act==='r') return 0;
+  if(r&&S.set.invent&&INVENT[r.bp]) return 4;   // invented BPC base TE4
+  return S.set.te;
 }
 function isBuild(tid){ return RECIPES[tid] && !S.buy[tid]; }
 function matMod(tid){
@@ -233,13 +279,14 @@ function computePlan(){
       const r=RECIPES[tid];
       const runs=Math.ceil(net/r.q);
       res.steps.push({tid,runs,net,depth:depth.get(tid),act:r.act,
-        time:r.t*runs*(1-(S.set.te||0)/100)});
+        time:r.t*runs*(1-teFor(tid)/100)*timeFactor(r.act)});
       for(const [mid,q] of jobMats(tid,runs))
         demand.set(mid,(demand.get(mid)||0)+q);
       if(S.set.invent && INVENT[r.bp]){
         const iv=INVENT[r.bp];
-        const attempts=Math.ceil(runs/(iv.q*iv.prob));
-        res.invRows.push({tid,bp:r.bp,iv,runs,attempts});
+        const p=effProb(iv);
+        const attempts=Math.ceil(runs/(iv.q*p));
+        res.invRows.push({tid,bp:r.bp,iv,runs,attempts,p});
         for(const [mid,q] of iv.mats)
           demand.set(mid,(demand.get(mid)||0)+q*attempts);
         if(tcat(iv.from)==='Ancient Relics')
@@ -282,12 +329,13 @@ function renderReadouts(){
   r.innerHTML=
     `<span>${Object.keys(RECIPES).length||'…'} recipes</span>`+
     `<span>${pdot} jita ${fetchingPrices?'updating…':ago(S.priceTs)} <button id="priceBtn">refresh</button></span>`+
-    `<span>${SSO?`<span class="dot">●</span> ${esc(SSO.charName)} <button id="bpBtn">sync BPs</button> <button id="outBtn">logout</button>`
+    `<span>${SSO?`<span class="dot">●</span> ${esc(SSO.charName)} <button id="bpBtn">sync</button> <button id="outBtn">logout</button>`
                :`<span class="dot off">●</span> not logged in <button id="inBtn">EVE login</button>`}</span>`+
     `<button id="themeBtn" title="theme">${S.theme==='dark'?'◐ dark':S.theme==='light'?'◑ light':'◓ auto'}</button>`;
   const on=(id,f)=>{const b=$(id);if(b)b.onclick=f;};
   on('priceBtn',()=>refreshPrices(true));
-  on('inBtn',ssoLogin); on('outBtn',ssoLogout); on('bpBtn',pullBlueprints);
+  on('inBtn',ssoLogin); on('outBtn',ssoLogout);
+  on('bpBtn',async()=>{await pullBlueprints();await pullSkills();});
   on('themeBtn',()=>{S.theme=S.theme===''?'dark':S.theme==='dark'?'light':'';
     applyTheme();save();renderReadouts();});
 }
@@ -442,33 +490,68 @@ function renderSteps(){
   const plan=computePlan();
   if(!plan.steps.length)return '<div class="empty">Nothing to build yet — add a target, or everything is covered by stock.</div>';
   const maxd=Math.max(...plan.steps.map(s=>s.depth));
-  let h=`<div class="note">Steps run bottom-up: deepest tier first. Times assume TE ${S.set.te}% on all jobs; split runs across slots as you like.</div><div class="scroller"><table>
-  <tr><th>Step</th><th colspan="2">Product</th><th></th><th class="num">Units</th><th class="num">Runs</th><th class="num">Output/run</th><th class="num">Job time</th><th>Blueprint</th></tr>`;
-  let step=1,lastTier=null,totalTime=0;
+  const sl=slots(), haveSkills=Object.keys(S.skills).length>0;
+  // wall-clock: longest-processing-time packing of each tier's jobs into your slots
+  const makespan=(times,n)=>{ if(!times.length)return 0;
+    const heap=Array(Math.max(1,n)).fill(0);
+    times.sort((a,b)=>b-a);
+    for(const t of times){heap.sort((a,b)=>a-b);heap[0]+=t;}
+    return Math.max(...heap); };
+  const tiers={};
+  for(const s of plan.steps)(tiers[s.depth]??=[]).push(s);
+  let wall=0;
+  for(const d of Object.keys(tiers))
+    wall+=Math.max(makespan(tiers[d].filter(x=>x.act!=='r').map(x=>x.time),sl.m),
+                   makespan(tiers[d].filter(x=>x.act==='r').map(x=>x.time),sl.r));
+  let h=`<div class="note">Jobs run bottom-up: deepest tier first. ${haveSkills
+    ?`Times, slots and invention odds use your synced skills: <b>${sl.m}</b> manufacturing / <b>${sl.r}</b> reaction slots.`
+    :'Log in with EVE (Prices · Stock · ESI tab) and your skills set job times, slot counts and invention odds.'}
+    Click any row to see the materials that go into that job.</div><div class="scroller"><table>
+  <tr><th></th><th colspan="2">Product</th><th></th><th class="num">Units</th><th class="num">Runs</th><th class="num">ME / TE</th><th class="num">Job time</th><th>Blueprint</th></tr>`;
+  let lastTier=null,totalTime=0;
   for(const s of plan.steps){
     const tier=maxd-s.depth;
     if(tier!==lastTier){
-      h+=`<tr class="stepdepth"><td colspan="9">Tier ${tier+1} — ${s.depth===0?'final products':(s.act==='r'?'reactions / intermediates':'intermediates')}</td></tr>`;
+      const g=tiers[s.depth];
+      const tw=Math.max(makespan(g.filter(x=>x.act!=='r').map(x=>x.time),sl.m),
+                        makespan(g.filter(x=>x.act==='r').map(x=>x.time),sl.r));
+      h+=`<tr class="stepdepth"><td colspan="9">Tier ${tier+1} — ${s.depth===0?'final products':(s.act==='r'?'reactions / intermediates':'intermediates')} · wall-clock ≈ ${fmtTime(tw)}</td></tr>`;
       lastTier=tier;
     }
     totalTime+=s.time;
-    h+=`<tr><td class="num">${step++}</td><td style="width:28px">${icon(s.tid)}</td><td>${esc(tname(s.tid))}</td><td>${pillFor(s.tid)}</td>
+    const open=!!S.open['st'+s.tid];
+    const r=RECIPES[s.tid];
+    const meTxt=r.act==='r'?'—':('ME'+meFor(s.tid)+' / TE'+teFor(s.tid));
+    const meSrc=S.me[s.tid]!=null?' title="from your blueprints"':'';
+    h+=`<tr class="steprow" data-st="${s.tid}"><td class="num" style="width:22px;color:var(--fg2)">${open?'−':'+'}</td>
+      <td style="width:28px">${icon(s.tid)}</td><td>${esc(tname(s.tid))}</td><td>${pillFor(s.tid)}</td>
       <td class="num">${fmt(s.net)}</td><td class="num">${fmt(s.runs)}</td>
-      <td class="num">${fmt(RECIPES[s.tid].q)}</td><td class="num">${fmtTime(s.time)}</td>
-      <td class="meta" style="color:var(--fg2);font-size:12px">${esc(tname(RECIPES[s.tid].bp))}</td></tr>`;
+      <td class="num"${meSrc}>${meTxt}${S.me[s.tid]!=null?' <span class="src">yours</span>':''}</td>
+      <td class="num">${fmtTime(s.time)}</td>
+      <td class="meta" style="color:var(--fg2);font-size:12px">${esc(tname(r.bp))}</td></tr>`;
+    if(open){
+      for(const [mid,q] of jobMats(s.tid,s.runs)){
+        const built=isBuild(mid), ps=price(mid).s;
+        h+=`<tr class="submat"><td></td><td style="width:28px">${icon(mid)}</td>
+          <td style="padding-left:16px">${esc(tname(mid))}</td>
+          <td><span class="pill">${built?'built below':'buy'}</span></td>
+          <td class="num">${fmt(q)}</td><td></td><td></td>
+          <td class="num">${ps!=null?fmtISK(ps*q):''}</td><td></td></tr>`;
+      }
+    }
   }
-  h+=`<tr class="total"><td colspan="7">Total job time (sequential)</td><td class="num">${fmtTime(totalTime)}</td><td></td></tr></table></div>`;
+  h+=`<tr class="total"><td colspan="7">Job time: sequential total / wall-clock with your slots</td><td class="num">${fmtTime(totalTime)} / ≈${fmtTime(wall)}</td><td></td></tr></table></div>`;
   if(plan.invRows.length){
     h+=`<div class="sec"><h2>Invention</h2><div class="scroller"><table>
     <tr><th>For</th><th class="num">Runs needed</th><th class="num">Prob.</th><th class="num">Runs/BPC</th><th class="num">Expected attempts</th><th>Per attempt</th><th>Source</th></tr>`;
     for(const r of plan.invRows){
       h+=`<tr><td>${icon(r.tid)} ${esc(tname(r.tid))}</td><td class="num">${fmt(r.runs)}</td>
-      <td class="num">${(r.iv.prob*100).toFixed(0)}%</td><td class="num">${r.iv.q}</td>
+      <td class="num" title="base ${(r.iv.prob*100).toFixed(0)}%">${((r.p??r.iv.prob)*100).toFixed(0)}%</td><td class="num">${r.iv.q}</td>
       <td class="num">${fmt(r.attempts)}</td>
       <td class="meta" style="color:var(--fg2);font-size:12px">${r.iv.mats.map(([m,q])=>q+'× '+esc(tname(m))).join(', ')}</td>
       <td class="meta" style="color:var(--fg2);font-size:12px">${esc(tname(r.iv.from))}${tcat(r.iv.from)==='Ancient Relics'?' (consumed)':''}</td></tr>`;
     }
-    h+=`</table></div><div class="note">Base probability only — skills and decryptors not applied. Datacores (and relics) for the expected attempts are already in the shopping list.</div></div>`;
+    h+=`</table></div><div class="note">${Object.keys(S.skills).length?'Probabilities include your encryption and science skills; decryptors not applied.':'Base probability — log in with EVE to apply your skills; decryptors not applied.'} Datacores (and relics) for the expected attempts are already in the shopping list.</div></div>`;
   }
   if(plan.stockUsed.size){
     h+=`<div class="sec"><h2>Covered from stock</h2><table><tr><th>Item</th><th class="num">Used</th></tr>`;
@@ -511,7 +594,7 @@ function renderShop(){
     <div class="kpi"><div class="l">Haul volume</div><div class="v">${fmt(tv,0)} m³</div></div>
     <div class="kpi"><div class="l">Product sell value</div><div class="v">${ok?fmtISK(sellV):'—'}</div></div>
     <div class="kpi"><div class="l">Margin (sell − mat@sell)</div><div class="v ${ok&&sellV-ts>=0?'good':'bad'}">${ok?fmtISK(sellV-ts):'—'}</div></div>
-  </div>`+(missing?`<div class="note">⚠ ${missing} item(s) have no live price yet — hit <b>refresh</b> in the header, or totals fall back to SDE base prices where marked.</div>`:'')+h+
+  </div>`+(missing?`<div class="note">⚠ ${missing} item(s) have no price yet and are excluded from the totals — hit <b>refresh</b> next to “jita” in the header.</div>`:'')+h+
   `<div class="note">Edit any unit price inline (stored as manual override). “to stock” marks the full quantity as already owned. Job install costs / taxes are not included.</div>`;
   return h;
 }
@@ -535,15 +618,16 @@ function renderData(){
       <h2>EVE SSO — your blueprints</h2>
       <div class="note">One-time setup: create an application at
       <a href="https://developers.eveonline.com/applications" target="_blank" rel="noopener">developers.eveonline.com</a>
-      — type <b>Authentication &amp; API access</b>, scope <code>esi-characters.read_blueprints.v1</code>,
-      callback URL exactly <code id="cbUrl"></code> — then paste its Client ID here. Tokens live only in this browser.</div>
+      — type <b>Authentication &amp; API access</b>, scopes <code>esi-characters.read_blueprints.v1</code> and <code>esi-skills.read_skills.v1</code>,
+      callback URL exactly <code id="cbUrl"></code> — then paste its Client ID here. Tokens live only in this browser.
+      Already registered with only the blueprint scope? Add the skills scope to the app and log in again.</div>
       <label class="f" style="color:var(--fg2)">ESI application client ID
         <input type="text" id="clientId" style="max-width:420px" value="${esc(S.set.clientId||'')}" placeholder="e.g. 0a1b2c3d4e5f…"></label>
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
         ${SSO?`<button id="bpImport2">Sync blueprints (${esc(SSO.charName)})</button><button class="quiet" id="outBtn2">Log out</button>`
              :`<button id="loginBtn">Log in with EVE Online</button>`}
         <button class="quiet" id="meClear">Reset ME overrides</button>
-        <span class="note">${Object.keys(S.me).length} ME overrides active</span>
+        <span class="note">${Object.keys(S.me).length} ME overrides · ${Object.keys(S.skills).length?Object.keys(S.skills).length+' skills synced ('+slots().m+' mfg / '+slots().r+' reaction / '+slots().s+' science slots)':'skills not synced'}</span>
       </div>
     </div>
   </div>
@@ -663,6 +747,8 @@ function wirePanel(){
     const sa=e.target.closest('[data-stockadd]');
     if(sa){const tid=sa.dataset.stockadd;const plan=computePlan();const q=plan.shop.get(+tid)||0;
       S.stock[tid]=(S.stock[tid]||0)+q;toast('Moved '+fmt(q)+' × '+tname(tid)+' to stock');render();save();return;}
+    const st=e.target.closest('[data-st]');
+    if(st){const k='st'+st.dataset.st;S.open[k]=!S.open[k];render();save();return;}
     const sd=e.target.closest('[data-stockdel]');
     if(sd){delete S.stock[sd.dataset.stockdel];render();save();return;}
     if(e.target.id==='priceImport'){const n=importPrices($('pricePaste').value);toast(n?('Imported prices for '+n+' types'):'Nothing recognized — check the format');render();save();return;}
