@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>New Eden Foundry</title>
+<meta name="description" content="EVE Online production calculator — full industry chains for capitals, T2/T3 and reactions, live Jita prices, and your own blueprints via ESI.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b0b0b'/%3E%3Cpath d='M3 13V6l5-3 5 3v7h-3V8L8 6.5 6 8v5z' fill='%234589ff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://images.evetech.net">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-in">
+    <div class="mast-top">
+      <div>
+        <div class="eyebrow">Industrial control · Tranquility</div>
+        <h1>New Eden Foundry</h1>
+      </div>
+      <div class="readouts" id="readouts"></div>
+    </div>
+    <div class="toolbar">
+      <div class="searchbox">
+        <label class="f">Product search
+          <input type="text" id="search" placeholder="Thanatos, Hammerhead II, Fullerides, Capital Armor Plates…" autocomplete="off">
+        </label>
+        <div class="sugs" id="sugs" hidden></div>
+      </div>
+      <label class="f">Quantity<input type="number" id="qty" value="1" min="1" step="1"></label>
+      <button id="addBtn">Add to plan</button>
+      <span style="flex:1"></span>
+      <label class="f">Default ME %<input type="number" id="defME" min="0" max="10" step="1"></label>
+      <label class="f">Default TE %<input type="number" id="defTE" min="0" max="20" step="2"></label>
+      <label class="f">Mfg struct %<input type="number" id="structM" min="0" max="6" step="0.1"></label>
+      <label class="f">React struct %<input type="number" id="structR" min="0" max="6" step="0.1"></label>
+      <label class="f checkrow"><input type="checkbox" id="invToggle"> Invention</label>
+    </div>
+  </div>
+</header>
+
+<main class="shell">
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tab-plan" aria-selected="true">Build plan</button>
+    <button role="tab" id="tab-steps" aria-selected="false">Production steps</button>
+    <button role="tab" id="tab-shop" aria-selected="false">Shopping list</button>
+    <button role="tab" id="tab-data" aria-selected="false">Prices · Stock · ESI</button>
+  </div>
+  <div class="panel" id="panel"><div class="empty">Loading static data…</div></div>
+</main>
+
+<div class="msg" id="msg"></div>
+<script src="js/app.js"></script>
+</body>
+</html>
