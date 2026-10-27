@@ -642,6 +642,8 @@ function renderShop(){
   const rows=[...plan.shop.entries()].map(([tid,q])=>({tid:+tid,q}));
   rows.sort((a,b)=>tcat(a.tid).localeCompare(tcat(b.tid))||tname(a.tid).localeCompare(tname(b.tid)));
   let tb=0,ts=0,tv=0,missing=0;
+  const drivers=rows.map(r=>{const p=price(r.tid);return {tid:r.tid,q:r.q,tot:p.s!=null?p.s*r.q:0,unit:p.s,src:p.src};})
+    .sort((a,b)=>b.tot-a.tot).slice(0,6);
   let h=`<div class="scroller"><table>
   <tr><th colspan="2">Material</th><th>Category</th><th class="num">Quantity</th><th class="num">Volume m³</th>
   <th class="num">Unit sell</th><th class="num">Total @ sell</th><th class="num">Total @ buy</th><th></th></tr>`;
@@ -670,7 +672,15 @@ function renderShop(){
     <div class="kpi"><div class="l">Haul volume</div><div class="v">${fmt(tv,0)} m³</div></div>
     <div class="kpi"><div class="l">Product sell value</div><div class="v">${ok?fmtISK(sellV):'—'}</div></div>
     <div class="kpi"><div class="l">Margin (sell − mat@sell)</div><div class="v ${ok&&sellV-ts>=0?'good':'bad'}">${ok?fmtISK(sellV-ts):'—'}</div></div>
-  </div>`+(missing?`<div class="note">⚠ ${missing} item(s) have no price yet and are excluded from the totals — hit <b>refresh</b> next to “jita” in the header.</div>`:'')+h+
+  </div>`+
+  `<div class="sec"><h2>Top cost drivers</h2><div class="scroller"><table>
+    <tr><th colspan="2">Material</th><th class="num">Qty</th><th class="num">Unit (src)</th><th class="num">Total</th><th class="num">% of mat cost</th></tr>
+    ${drivers.map(d=>`<tr><td style="width:28px">${icon(d.tid)}</td><td>${esc(tname(d.tid))}</td>
+      <td class="num">${fmt(d.q)}</td><td class="num">${fmtISK(d.unit)} <span class="src">${d.src}</span></td>
+      <td class="num">${fmtISK(d.tot)}</td><td class="num">${ts?(d.tot/ts*100).toFixed(1)+'%':'—'}</td></tr>`).join('')}
+  </table></div>
+  <div class="note">If one of these looks absurd, check its src tag: <code>struct</code> prices come from a player market and a thin order book can carry troll prices — edit the unit price inline, or clear prices and refresh for Jita numbers.</div></div>`+
+  (missing?`<div class="note">⚠ ${missing} item(s) have no price yet and are excluded from the totals — hit <b>refresh</b> next to “jita” in the header.</div>`:'')+h+
   `<div class="note">Edit any unit price inline (stored as manual override). “to stock” marks the full quantity as already owned. Job install costs / taxes are not included.</div>`;
   return h;
 }
