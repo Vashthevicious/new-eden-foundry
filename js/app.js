@@ -427,6 +427,7 @@ function renderReadouts(){
     `<span>${pdot} jita ${fetchingPrices?'updating…':ago(S.priceTs)} <button id="priceBtn">refresh</button></span>`+
     `<span>${SSO?`<span class="dot">●</span> ${esc(SSO.charName)}${SSO.sys?' @ '+esc(SSO.sys):''} <button id="bpBtn">sync</button> <button id="outBtn">logout</button>`
                :`<span class="dot off">●</span> not logged in <button id="inBtn">EVE login</button>`}</span>`+
+    (Object.keys(S.skills).length?`<span title="from your Mass Production / Reactions / Laboratory skills">⚒ <b>${slots().m}</b> mfg · <b>${slots().r}</b> react · <b>${slots().s}</b> sci slots</span>`:'')+
     `<button id="themeBtn" title="theme">${S.theme==='dark'?'◐ dark':S.theme==='light'?'◑ light':'◓ auto'}</button>`;
   const on=(id,f)=>{const b=$(id);if(b)b.onclick=f;};
   on('priceBtn',()=>refreshPrices(true));
@@ -607,16 +608,49 @@ function renderSteps(){
   let h=`<div class="note">Jobs run bottom-up: deepest tier first. ${haveSkills
     ?`Times, slots and invention odds use your synced skills: <b>${sl.m}</b> manufacturing / <b>${sl.r}</b> reaction slots.`
     :'Log in with EVE (Prices · Stock · ESI tab) and your skills set job times, slot counts and invention odds.'}
-    Click any row to see the materials that go into that job.</div><div class="scroller"><table>
+    Click any row to see the materials that go into that job.</div>`;
+  // Tier 0 — procurement: raw-input totals, moon goo and PI as flat totals
+  if(plan.shop.size){
+    const groupsOf={};
+    for(const [tid,q] of plan.shop){
+      const lab=tcat(tid)==='Planetary Commodities'?'Planetary commodities (PI)':(tgroup(tid)||'Other');
+      (groupsOf[lab]??=[]).push({tid:+tid,q});
+    }
+    const pref=['Mineral','Moon Materials','Ice Product','Planetary commodities (PI)','Fuel Block','Salvaged Materials','Datacores'];
+    const labs=Object.keys(groupsOf).sort((a,b)=>{
+      const ia=pref.indexOf(a),ib=pref.indexOf(b);
+      return (ia<0?99:ia)-(ib<0?99:ib)||a.localeCompare(b);});
+    h+=`<div class="sec"><h2>Tier 0 — procurement</h2><div class="scroller"><table>
+      <tr><th colspan="2">Raw input</th><th class="num">Quantity</th><th class="num">Volume m³</th><th class="num">Total @ sell</th></tr>`;
+    for(const lab of labs){
+      const rows=groupsOf[lab].sort((a,b)=>tname(a.tid).localeCompare(tname(b.tid)));
+      let gq=0,gv=0,gt=0,priced=true;
+      for(const r of rows){const p=price(r.tid).s;gv+=(TYPES[r.tid]&&TYPES[r.tid].v||0)*r.q;
+        if(p!=null)gt+=p*r.q;else priced=false;}
+      h+=`<tr class="stepdepth"><td colspan="2">${esc(lab)} · ${rows.length} type${rows.length>1?'s':''}</td>
+        <td></td><td class="num">${fmt(gv,0)}</td><td class="num">${fmtISK(gt)}${priced?'':' +?'}</td></tr>`;
+      for(const r of rows){
+        const p=price(r.tid).s;
+        h+=`<tr><td style="width:28px">${icon(r.tid)}</td><td>${esc(tname(r.tid))}</td>
+          <td class="num">${fmt(r.q)}</td><td class="num">${fmt((TYPES[r.tid]&&TYPES[r.tid].v||0)*r.q,1)}</td>
+          <td class="num">${p!=null?fmtISK(p*r.q):'—'}</td></tr>`;
+      }
+    }
+    h+=`</table></div><div class="note">Everything the plan consumes but does not build — gather or buy this before tier 1 starts. PI commodities are totals only; their planet-side chains are deliberately not expanded.</div></div>`;
+  }
+  h+=`<div class="scroller"><table>
   <tr><th></th><th colspan="2">Product</th><th></th><th class="num">Units</th><th class="num">Runs</th><th class="num">ME / TE</th><th class="num">Job time</th><th>Blueprint</th></tr>`;
   let lastTier=null,totalTime=0;
   for(const s of plan.steps){
     const tier=maxd-s.depth;
     if(tier!==lastTier){
       const g=tiers[s.depth];
+      const mJ=g.filter(x=>x.act!=='r').length, rJ=g.filter(x=>x.act==='r').length;
       const tw=Math.max(makespan(g.filter(x=>x.act!=='r').map(x=>x.time),sl.m),
                         makespan(g.filter(x=>x.act==='r').map(x=>x.time),sl.r));
-      h+=`<tr class="stepdepth"><td colspan="9">Tier ${tier+1} — ${s.depth===0?'final products':(s.act==='r'?'reactions / intermediates':'intermediates')} · wall-clock ≈ ${fmtTime(tw)}</td></tr>`;
+      const slotTxt=[mJ?`${mJ} mfg job${mJ>1?'s':''} on ${sl.m} slot${sl.m>1?'s':''}`:'',
+                     rJ?`${rJ} reaction job${rJ>1?'s':''} on ${sl.r} slot${sl.r>1?'s':''}`:''].filter(Boolean).join(' · ');
+      h+=`<tr class="stepdepth"><td colspan="9">Tier ${tier+1} — ${s.depth===0?'final products':(s.act==='r'?'reactions / intermediates':'intermediates')} · ${slotTxt} · wall-clock ≈ ${fmtTime(tw)}</td></tr>`;
       lastTier=tier;
     }
     totalTime+=s.time;
@@ -680,7 +714,8 @@ function renderShop(){
     if(cs!=null)ts+=cs; else missing++;
     if(cb!=null)tb+=cb;
     if(cat!==lastCat){h+=`<tr class="stepdepth"><td colspan="9">${esc(cat)||'Other'}</td></tr>`;lastCat=cat;}
-    h+=`<tr><td style="width:28px">${icon(r.tid)}</td><td>${esc(tname(r.tid))}</td><td class="meta" style="color:var(--fg2);font-size:12px">${esc(tgroup(r.tid))}</td>
+    const buildable=!!RECIPES[r.tid];
+    h+=`<tr><td style="width:28px">${icon(r.tid)}</td><td>${esc(tname(r.tid))}${buildable?' <span class="pill" title="on this list because it is set to buy">bought</span> <button class="tiny ghost" data-buildit="'+r.tid+'">build instead</button>':''}</td><td class="meta" style="color:var(--fg2);font-size:12px">${esc(tgroup(r.tid))}</td>
       <td class="num">${fmt(r.q)}</td><td class="num">${fmt(v,1)}</td>
       <td class="num"><input type="text" class="price-in" data-pman="${r.tid}" value="${p.s!=null?p.s:''}" placeholder="—">
         <span class="src">${p.src==='base'?'base':p.src==='man'?'manual':p.src}</span></td>
@@ -871,6 +906,8 @@ function wirePanel(){
     if(bb){const tid=bb.dataset.bb;if(S.buy[tid])delete S.buy[tid];else S.buy[tid]=1;render();save();refreshPrices();return;}
     const del=e.target.closest('[data-del]');
     if(del){S.targets.splice(+del.dataset.del,1);render();save();return;}
+    const bi=e.target.closest('[data-buildit]');
+    if(bi){delete S.buy[bi.dataset.buildit];render();save();refreshPrices();return;}
     const sa=e.target.closest('[data-stockadd]');
     if(sa){const tid=sa.dataset.stockadd;const plan=computePlan();const q=plan.shop.get(+tid)||0;
       S.stock[tid]=(S.stock[tid]||0)+q;toast('Moved '+fmt(q)+' × '+tname(tid)+' to stock');render();save();return;}
