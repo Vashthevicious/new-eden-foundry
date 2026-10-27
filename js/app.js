@@ -9,7 +9,7 @@ let TYPES={}, RECIPES={}, INVENT={}, GROUPS={}, NAME2ID={};
 const LSKEY='nef-site-v1', SSOKEY='nef-sso-v1';
 const SSO_BASE='https://login.eveonline.com/v2/oauth';
 const ESI='https://esi.evetech.net/latest';
-const SSO_SCOPES='esi-characters.read_blueprints.v1 esi-skills.read_skills.v1';
+const SSO_SCOPES='esi-characters.read_blueprints.v1 esi-skills.read_skills.v1 esi-assets.read_assets.v1 esi-location.read_location.v1 esi-universe.read_structures.v1 esi-markets.structure_markets.v1';
 let S={ targets:[], buy:{}, me:{}, te:{}, stock:{}, prices:{}, manual:{}, skills:{},
         set:{me:0,te:0,structM:0,structR:0,invent:false,clientId:''},
         tab:'plan', open:{}, theme:'', priceTs:0 };
@@ -159,6 +159,7 @@ async function ssoCallback(){
     toast('Logged in as '+SSO.charName);
     await pullBlueprints();
     await pullSkills();
+    pullLocation();
   }catch(e){toast('SSO login failed: '+e.message);}
   return true;
 }
@@ -210,6 +211,81 @@ async function pullSkills(){
     toast('Skills synced — '+sl.m+' mfg / '+sl.r+' reaction slots, times and invention odds updated');
     save();render();
   }catch(e){toast('Skill fetch failed: '+e.message);}
+}
+async function pullLocation(){
+  const tok=await ssoAccess(); if(!tok)return;
+  try{
+    const r=await fetch(ESI+'/characters/'+SSO.charId+'/location/',{headers:{Authorization:'Bearer '+tok}});
+    if(!r.ok)return;
+    const j=await r.json();
+    const s=await fetch(ESI+'/universe/systems/'+j.solar_system_id+'/');
+    if(s.ok){SSO.sys=(await s.json()).name;saveSSO();renderReadouts();}
+  }catch(e){}
+}
+async function pullAssets(){
+  const tok=await ssoAccess();
+  if(!tok){toast('Log in with EVE first');return;}
+  const plan=computePlan();
+  const wanted=new Set([...plan.shop.keys(),...plan.gross.keys()].map(Number));
+  if(!wanted.size){toast('Add a build target first — assets are matched against the plan');return;}
+  try{
+    let page=1,pages=1;
+    const agg={};
+    while(page<=pages){
+      const r=await fetch(ESI+'/characters/'+SSO.charId+'/assets/?page='+page,
+        {headers:{Authorization:'Bearer '+tok}});
+      if(!r.ok)throw new Error('http '+r.status);
+      pages=+(r.headers.get('x-pages')||1);
+      for(const a of await r.json()){
+        if(!wanted.has(a.type_id))continue;
+        const f=a.location_flag||'';
+        if(f.includes('Hangar')||f==='Deliveries'||f==='Unlocked')
+          agg[a.type_id]=(agg[a.type_id]||0)+(a.quantity||1);
+      }
+      page++;
+    }
+    let n=0;
+    for(const[tid,q]of Object.entries(agg)){S.stock[tid]=q;n++;}
+    toast(n?('Stock set from assets: '+n+' material types'):'No plan materials found in your hangars');
+    save();render();
+  }catch(e){toast('Asset fetch failed: '+e.message);}
+}
+async function fetchStructMarket(){
+  const sid=String(S.set.structId||'').trim();
+  if(!/^\d{10,}$/.test(sid)){toast('Enter a structure ID first (the long number from the in-game market or a killboard link)');return;}
+  const tok=await ssoAccess();
+  if(!tok){toast('Log in with EVE first — structure markets need auth');return;}
+  if(fetchingPrices)return;
+  fetchingPrices=true;renderReadouts();
+  try{
+    let sname='structure '+sid;
+    try{const sr=await fetch(ESI+'/universe/structures/'+sid+'/',{headers:{Authorization:'Bearer '+tok}});
+      if(sr.ok)sname=(await sr.json()).name;
+      else if(sr.status===403)throw new Error('no docking access to that structure');
+    }catch(e){if(/docking/.test(e.message))throw e;}
+    let page=1,pages=1;
+    const orders={};
+    while(page<=pages&&page<=200){
+      const r=await fetch(ESI+'/markets/structures/'+sid+'/?page='+page,
+        {headers:{Authorization:'Bearer '+tok}});
+      if(!r.ok)throw new Error('http '+r.status);
+      pages=+(r.headers.get('x-pages')||1);
+      for(const o of await r.json()){
+        const e=orders[o.type_id]??={s:null,b:null};
+        if(o.is_buy_order){ if(e.b==null||o.price>e.b)e.b=o.price; }
+        else if(e.s==null||o.price<e.s)e.s=o.price;
+      }
+      page++;
+    }
+    const ids=new Set(planTypeIds());
+    let n=0;
+    for(const[tid,v]of Object.entries(orders))
+      if(ids.has(+tid)){S.prices[tid]={s:v.s,b:v.b,src:'struct'};n++;}
+    S.priceTs=Date.now();S.set.structName=sname;
+    toast('Priced '+n+' plan types from '+sname+(pages>200?' (first 200 pages)':''));
+    save();render();
+  }catch(e){toast('Structure market fetch failed: '+e.message);}
+  fetchingPrices=false;renderReadouts();
 }
 function ssoLogout(){SSO=null;saveSSO();renderReadouts();render();toast('Logged out');}
 
@@ -329,13 +405,13 @@ function renderReadouts(){
   r.innerHTML=
     `<span>${Object.keys(RECIPES).length||'…'} recipes</span>`+
     `<span>${pdot} jita ${fetchingPrices?'updating…':ago(S.priceTs)} <button id="priceBtn">refresh</button></span>`+
-    `<span>${SSO?`<span class="dot">●</span> ${esc(SSO.charName)} <button id="bpBtn">sync</button> <button id="outBtn">logout</button>`
+    `<span>${SSO?`<span class="dot">●</span> ${esc(SSO.charName)}${SSO.sys?' @ '+esc(SSO.sys):''} <button id="bpBtn">sync</button> <button id="outBtn">logout</button>`
                :`<span class="dot off">●</span> not logged in <button id="inBtn">EVE login</button>`}</span>`+
     `<button id="themeBtn" title="theme">${S.theme==='dark'?'◐ dark':S.theme==='light'?'◑ light':'◓ auto'}</button>`;
   const on=(id,f)=>{const b=$(id);if(b)b.onclick=f;};
   on('priceBtn',()=>refreshPrices(true));
   on('inBtn',ssoLogin); on('outBtn',ssoLogout);
-  on('bpBtn',async()=>{await pullBlueprints();await pullSkills();});
+  on('bpBtn',async()=>{await pullBlueprints();await pullSkills();pullLocation();});
   on('themeBtn',()=>{S.theme=S.theme===''?'dark':S.theme==='dark'?'light':'';
     applyTheme();save();renderReadouts();});
 }
@@ -606,6 +682,12 @@ function renderData(){
     <div class="sec">
       <h2>Live prices</h2>
       <div class="note">Jita 4-4 buy/sell comes from Fuzzwork market aggregates for exactly the types in your plan, with ESI universe averages as fallback. Prices auto-refresh when you change the plan and can be refreshed from the header readout. Last update: <b>${ago(S.priceTs)}</b>.</div>
+      ${SSO?`<div class="note"><b>Structure market</b> — price the plan against a player structure you can dock in (overrides Jita for types it stocks):</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="structId" class="price-in" style="width:170px !important;text-align:left" placeholder="structure ID" value="${esc(S.set.structId||'')}">
+        <button class="ghost" id="structFetch">Fetch structure prices</button>
+        ${S.set.structName?`<span class="note">${esc(S.set.structName)}</span>`:''}
+      </div>`:''}
       <div class="note">You can still paste prices manually (Fuzzwork JSON, ESI <code>/markets/prices/</code> JSON, or <code>name&lt;tab&gt;sell&lt;tab&gt;buy</code> lines):</div>
       <textarea id="pricePaste" placeholder='Optional manual paste'></textarea>
       <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
@@ -618,9 +700,12 @@ function renderData(){
       <h2>EVE SSO — your blueprints</h2>
       <div class="note">One-time setup: create an application at
       <a href="https://developers.eveonline.com/applications" target="_blank" rel="noopener">developers.eveonline.com</a>
-      — type <b>Authentication &amp; API access</b>, scopes <code>esi-characters.read_blueprints.v1</code> and <code>esi-skills.read_skills.v1</code>,
-      callback URL exactly <code id="cbUrl"></code> — then paste its Client ID here. Tokens live only in this browser.
-      Already registered with only the blueprint scope? Add the skills scope to the app and log in again.</div>
+      — type <b>Authentication &amp; API access</b>, callback URL exactly <code id="cbUrl"></code>, with these scopes:
+      <code>esi-characters.read_blueprints.v1</code>, <code>esi-skills.read_skills.v1</code>,
+      <code>esi-assets.read_assets.v1</code>, <code>esi-location.read_location.v1</code>,
+      <code>esi-universe.read_structures.v1</code>, <code>esi-markets.structure_markets.v1</code>
+      — then paste its Client ID here. Tokens live only in this browser.
+      If the EVE login page shows a scope error, your app is missing one of the scopes above — add it and retry.</div>
       <label class="f" style="color:var(--fg2)">ESI application client ID
         <input type="text" id="clientId" style="max-width:420px" value="${esc(S.set.clientId||'')}" placeholder="e.g. 0a1b2c3d4e5f…"></label>
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
@@ -641,6 +726,7 @@ function renderData(){
       </div>
       <label class="f" style="color:var(--fg2)">Qty<input type="number" id="stockQty" value="1" min="1"></label>
       <button class="ghost" id="stockAdd">Add to stock</button>
+      ${SSO?'<button class="ghost" id="assetPull">Import from assets</button>':''}
       <button class="quiet" id="stockClear">Clear stock</button>
     </div>
     ${stockRows.length?`<div class="scroller"><table><tr><th colspan="2">Item</th><th class="num">On hand</th><th class="num">Used by plan</th><th></th></tr>${
@@ -761,6 +847,8 @@ function wirePanel(){
       if(!tid){toast('Pick an item from the search first');return;}
       S.stock[tid]=(S.stock[tid]||0)+q;delete P.dataset.stockPick;$('stockSearch').value='';render();save();return;}
     if(e.target.id==='stockClear'){S.stock={};render();save();return;}
+    if(e.target.id==='assetPull'){pullAssets();return;}
+    if(e.target.id==='structFetch'){fetchStructMarket();return;}
   };
   P.onchange=e=>{
     const t=e.target;
@@ -771,6 +859,7 @@ function wirePanel(){
     else if(t.dataset.stockq!=null){const v=parseFloat(t.value.replace(/,/g,''));
       if(!v||v<=0)delete S.stock[t.dataset.stockq];else S.stock[t.dataset.stockq]=v;render();save();}
     else if(t.id==='clientId'){S.set.clientId=t.value.trim();save();}
+    else if(t.id==='structId'){S.set.structId=t.value.trim();S.set.structName='';save();}
   };
   const cb=$('cbUrl'); if(cb)cb.textContent=location.origin+location.pathname;
   if($('stockSearch')){
