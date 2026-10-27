@@ -132,6 +132,7 @@ tr.submat td{background:var(--layer2);color:var(--fg2);font-size:12.5px;border-b
 .pill.react{border-color:var(--warn);color:var(--warn);}
 .pill.t2{border-color:var(--good);color:var(--good);}
 .me-in{width:46px !important;padding:2px 4px !important;font-size:12px;}
+.alt-sel{font-size:11px;padding:1px 4px;max-width:230px;background:var(--layer2);border:1px solid var(--warn);color:var(--fg);}
 .price-in{width:110px !important;padding:2px 6px !important;font-size:12px;text-align:right;font-family:var(--mono) !important;}
 
 /* target card with optional ship render */

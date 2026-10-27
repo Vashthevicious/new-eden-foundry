@@ -5,13 +5,13 @@
    - universe average/adjusted from ESI /markets/prices/
    - character blueprints via EVE SSO (PKCE, no secret, token never leaves browser)
 */
-let TYPES={}, RECIPES={}, INVENT={}, GROUPS={}, NAME2ID={};
+let TYPES={}, RECIPES={}, BASE_RECIPES={}, ALTS={}, INVENT={}, GROUPS={}, NAME2ID={};
 const LSKEY='nef-site-v1', SSOKEY='nef-sso-v1';
 const SSO_BASE='https://login.eveonline.com/v2/oauth';
 const ESI='https://esi.evetech.net/latest';
 const SSO_SCOPES='esi-characters.read_blueprints.v1 esi-skills.read_skills.v1 esi-assets.read_assets.v1 esi-location.read_location.v1 esi-universe.read_structures.v1 esi-markets.structure_markets.v1';
-let S={ targets:[], buy:{}, me:{}, te:{}, stock:{}, prices:{}, manual:{}, skills:{},
-        set:{me:0,te:0,structM:0,structR:0,invent:false,clientId:''},
+let S={ targets:[], buy:{}, me:{}, te:{}, stock:{}, prices:{}, manual:{}, skills:{}, rchoice:{},
+        set:{me:0,te:0,structM:0,structR:0,invent:false,clientId:'',basis:'pct'},
         tab:'plan', open:{}, theme:'', priceTs:0 };
 let SSO=null; // {access, refresh, exp, charId, charName}
 
@@ -41,10 +41,25 @@ function icon(tid,lg){ return `<img class="ticon${lg?' lg':''}" loading="lazy" a
   src="https://images.evetech.net/types/${tid}/icon?size=${lg?64:32}" onerror="this.style.visibility='hidden'">`; }
 
 /* ---------- prices ---------- */
+// a product with several recipes uses the largest-output one unless the user
+// picked another in the tree (S.rchoice[tid] = blueprint type id)
+function applyRecipeChoices(){
+  RECIPES={...BASE_RECIPES};
+  for(const [tid,bp] of Object.entries(S.rchoice||{})){
+    const a=(ALTS[tid]||[]).find(x=>x.bp===+bp);
+    if(a)RECIPES[tid]=a;
+  }
+}
 function price(tid){
   const m=S.manual[tid]; if(m&&(m.b!=null||m.s!=null))
     return {b:m.b??m.s, s:m.s??m.b, src:'man'};
-  const p=S.prices[tid]; if(p) return p;
+  const p=S.prices[tid];
+  if(p){
+    if(p.rich){ const k=S.set.basis||'pct';
+      return {s:p.rich.s[k]??p.rich.s.pct??p.rich.s.ext,
+              b:p.rich.b[k]??p.rich.b.pct??p.rich.b.ext, src:p.src}; }
+    return p;
+  }
   // deliberately no SDE base-price fallback: those numbers are decades stale
   // and poison totals; unpriced items stay visibly unpriced instead
   return {b:null,s:null,src:'none'};
@@ -93,7 +108,12 @@ async function refreshPrices(manual){
       if(!r.ok)throw new Error('http '+r.status);
       const j=await r.json();
       for(const[tid,v]of Object.entries(j)){
-        if(v&&v.sell&&v.buy){S.prices[tid]={s:+v.sell.min||null,b:+v.buy.max||null,src:'jita'};got++;}
+        if(v&&v.sell&&v.buy){
+          S.prices[tid]={src:'jita',rich:{
+            s:{ext:+v.sell.min||null, pct:+v.sell.percentile||+v.sell.min||null, avg:+v.sell.weightedAverage||null},
+            b:{ext:+v.buy.max||null,  pct:+v.buy.percentile||+v.buy.max||null,  avg:+v.buy.weightedAverage||null}}};
+          got++;
+        }
       }
     }
     S.priceTs=Date.now();
@@ -486,6 +506,11 @@ function renderNode(node,key,d){
     if(!buying&&r.act==='m')
       row+=`<span class="meta">ME</span><input type="number" class="me-in" data-me="${tid}" value="${meFor(tid)}" min="0" max="10">`;
     if(!buying)row+=`<span class="meta">${node.runs} run${node.runs>1?'s':''} · out ×${r.q}</span>`;
+    if(!buying&&ALTS[tid]&&ALTS[tid].length>1){
+      row+=`<select class="alt-sel" data-alt="${tid}" title="this product has more than one recipe">`+
+        ALTS[tid].map(a=>`<option value="${a.bp}"${RECIPES[tid].bp===a.bp?' selected':''}>${esc(tname(a.bp))} (×${a.q})</option>`).join('')+
+        `</select>`;
+    }
   }
   row+=`<span class="sp"></span>`;
   if(buying) row+=`<span class="meta">${p.s!=null?fmtISK(p.s*node.qty)+' @ sell':'no price'}${p.src==='base'?' <span class="src">(base)</span>':''}</span>`;
@@ -692,6 +717,12 @@ function renderData(){
     <div class="sec">
       <h2>Live prices</h2>
       <div class="note">Jita 4-4 buy/sell comes from Fuzzwork market aggregates for exactly the types in your plan, with ESI universe averages as fallback. Prices auto-refresh when you change the plan and can be refreshed from the header readout. Last update: <b>${ago(S.priceTs)}</b>.</div>
+      <label class="f" style="color:var(--fg2);max-width:320px">Price basis
+        <select id="basisSel">
+          <option value="pct"${(S.set.basis||'pct')==='pct'?' selected':''}>Realistic fill (5% percentile) — recommended</option>
+          <option value="ext"${S.set.basis==='ext'?' selected':''}>Best order (min sell / max buy)</option>
+          <option value="avg"${S.set.basis==='avg'?' selected':''}>Weighted average of whole book</option>
+        </select></label>
       ${SSO?`<div class="note"><b>Structure market</b> — price the plan against a player structure you can dock in (overrides Jita for types it stocks):</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <input type="text" id="structId" class="price-in" style="width:170px !important;text-align:left" placeholder="structure ID" value="${esc(S.set.structId||'')}">
@@ -870,6 +901,12 @@ function wirePanel(){
       if(!v||v<=0)delete S.stock[t.dataset.stockq];else S.stock[t.dataset.stockq]=v;render();save();}
     else if(t.id==='clientId'){S.set.clientId=t.value.trim();save();}
     else if(t.id==='structId'){S.set.structId=t.value.trim();S.set.structName='';save();}
+    else if(t.id==='basisSel'){S.set.basis=t.value;save();render();}
+    else if(t.dataset.alt!=null){
+      const tid=t.dataset.alt, bp=+t.value;
+      if(BASE_RECIPES[tid]&&BASE_RECIPES[tid].bp===bp)delete S.rchoice[tid];
+      else S.rchoice[tid]=bp;
+      applyRecipeChoices();save();render();refreshPrices();}
   };
   const cb=$('cbUrl'); if(cb)cb.textContent=location.origin+location.pathname;
   if($('stockSearch')){
@@ -909,7 +946,8 @@ function wireTop(){
       fetch('data/types.json').then(x=>x.json()),
       fetch('data/recipes.json').then(x=>x.json())
     ]);
-    TYPES=t;RECIPES=r.recipes;INVENT=r.invention;GROUPS=r.groups;
+    TYPES=t;BASE_RECIPES=r.recipes;ALTS=r.alts||{};INVENT=r.invention;GROUPS=r.groups;
+    applyRecipeChoices();
   }catch(e){
     $('panel').innerHTML='<div class="empty">Could not load the static data files (data/types.json, data/recipes.json). If you are opening this from disk, serve it over http instead.</div>';
     return;
