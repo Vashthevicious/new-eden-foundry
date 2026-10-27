@@ -9,11 +9,13 @@ let TYPES={}, RECIPES={}, BASE_RECIPES={}, ALTS={}, INVENT={}, GROUPS={}, NAME2I
 const LSKEY='nef-site-v1', SSOKEY='nef-sso-v1';
 const SSO_BASE='https://login.eveonline.com/v2/oauth';
 const ESI='https://esi.evetech.net/latest';
-const SSO_SCOPES='esi-characters.read_blueprints.v1 esi-skills.read_skills.v1 esi-assets.read_assets.v1 esi-location.read_location.v1 esi-universe.read_structures.v1 esi-markets.structure_markets.v1';
+const SSO_SCOPES='esi-characters.read_blueprints.v1 esi-skills.read_skills.v1 esi-assets.read_assets.v1 esi-location.read_location.v1 esi-universe.read_structures.v1 esi-markets.structure_markets.v1 esi-industry.read_character_jobs.v1';
 let S={ targets:[], buy:{}, me:{}, te:{}, stock:{}, prices:{}, manual:{}, skills:{}, rchoice:{},
-        set:{me:0,te:0,structM:0,structR:0,invent:false,clientId:'',basis:'pct'},
-        tab:'plan', open:{}, theme:'', priceTs:0 };
-let SSO=null; // {access, refresh, exp, charId, charName}
+        set:{me:0,te:0,structM:0,structR:0,invent:false,clientId:'',basis:'pct',
+             sciSys:'',sciM:0,sciR:0,tax:1,costBonus:0,scc:4},
+        adj:{}, tab:'plan', open:{}, theme:'', priceTs:0 };
+let SSO={chars:[]}; // [{access, refresh, exp, charId, charName, sys, skills}]
+let JOBS={};        // charId -> {ts, jobs:[]}
 
 /* ---------- utilities ---------- */
 const $=id=>document.getElementById(id);
@@ -33,7 +35,7 @@ function ago(ts){ if(!ts)return 'never'; const m=Math.round((Date.now()-ts)/6000
 function toast(t){ const m=$('msg'); m.textContent=t; m.style.display='block';
   clearTimeout(toast._t); toast._t=setTimeout(()=>m.style.display='none',3000); }
 function save(){ try{ localStorage.setItem(LSKEY, JSON.stringify(S)); }catch(e){} }
-function saveSSO(){ try{ SSO?localStorage.setItem(SSOKEY,JSON.stringify(SSO)):localStorage.removeItem(SSOKEY);}catch(e){} }
+function saveSSO(){ try{ SSO.chars.length?localStorage.setItem(SSOKEY,JSON.stringify(SSO)):localStorage.removeItem(SSOKEY);}catch(e){} }
 function tname(tid){ return TYPES[tid]?TYPES[tid].n:('#'+tid); }
 function tcat(tid){ const t=TYPES[tid]; if(!t||t.g==null)return ''; const g=GROUPS[t.g]; return g?g.c:''; }
 function tgroup(tid){ const t=TYPES[tid]; if(!t||t.g==null)return ''; const g=GROUPS[t.g]; return g?g.n:''; }
@@ -69,10 +71,18 @@ function price(tid){
 const SK={industry:3380,advIndustry:3388,reactions:45746,
           massProd:3387,advMassProd:24625,massReact:45748,advMassReact:45749,
           labOp:3406,advLabOp:24624};
-const skL=id=>S.skills[id]||0;
-function slots(){return {m:1+skL(SK.massProd)+skL(SK.advMassProd),
-                         r:1+skL(SK.massReact)+skL(SK.advMassReact),
-                         s:1+skL(SK.labOp)+skL(SK.advLabOp)};}
+// skill level: the best across all logged-in characters (jobs go to whoever is best);
+// slots: summed across characters that have synced skills (one player, many pilots)
+const skL=id=>Math.max(0,...SSO.chars.map(c=>(c.skills||{})[id]||0),S.skills[id]||0);
+function skilledChars(){const cs=SSO.chars.filter(c=>c.skills&&Object.keys(c.skills).length);
+  return cs.length?cs:(Object.keys(S.skills).length?[{skills:S.skills}]:[]);}
+function slots(){
+  const cs=skilledChars();
+  if(!cs.length)return {m:1,r:1,s:1};
+  const sum=k=>cs.reduce((a,c)=>a+1+((c.skills||{})[k[0]]||0)+((c.skills||{})[k[1]]||0),0);
+  return {m:sum([SK.massProd,SK.advMassProd]),
+          r:sum([SK.massReact,SK.advMassReact]),
+          s:sum([SK.labOp,SK.advLabOp])};}
 function timeFactor(act){
   if(act==='r') return 1-0.04*skL(SK.reactions);
   return (1-0.04*skL(SK.industry))*(1-0.03*skL(SK.advIndustry));
@@ -117,6 +127,7 @@ async function refreshPrices(manual){
       }
     }
     S.priceTs=Date.now();
+    await fetchCostData();
   }catch(e){
     failed=true;
     // fallback: ESI universe averages for anything still unpriced
@@ -160,10 +171,13 @@ async function ssoToken(body){
 }
 function applyToken(j){
   const payload=JSON.parse(atob(j.access_token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));
-  SSO={access:j.access_token, refresh:j.refresh_token,
+  const c={access:j.access_token, refresh:j.refresh_token,
        exp:Date.now()+(j.expires_in-60)*1000,
        charId:+String(payload.sub).split(':').pop(), charName:payload.name};
+  const i=SSO.chars.findIndex(x=>x.charId===c.charId);
+  if(i>=0)Object.assign(SSO.chars[i],c); else SSO.chars.push(c);
   saveSSO();
+  return SSO.chars[i>=0?i:SSO.chars.length-1];
 }
 async function ssoCallback(){
   const q=new URLSearchParams(location.search);
@@ -175,100 +189,174 @@ async function ssoCallback(){
   try{
     const j=await ssoToken({grant_type:'authorization_code',code:q.get('code'),
       client_id:S.set.clientId.trim(),code_verifier:st.verifier});
-    applyToken(j);
-    toast('Logged in as '+SSO.charName);
+    const c=applyToken(j);
+    toast('Logged in as '+c.charName);
     await pullBlueprints();
     await pullSkills();
     pullLocation();
   }catch(e){toast('SSO login failed: '+e.message);}
   return true;
 }
-async function ssoAccess(){
-  if(!SSO)return null;
-  if(Date.now()<SSO.exp)return SSO.access;
+async function ssoAccess(c){
+  c=c||SSO.chars[0];
+  if(!c)return null;
+  if(Date.now()<c.exp)return c.access;
   try{
-    const j=await ssoToken({grant_type:'refresh_token',refresh_token:SSO.refresh,
+    const j=await ssoToken({grant_type:'refresh_token',refresh_token:c.refresh,
       client_id:S.set.clientId.trim()});
     applyToken(j);
-    return SSO.access;
-  }catch(e){SSO=null;saveSSO();renderReadouts();toast('EVE login expired — log in again');return null;}
+    return c.access;
+  }catch(e){
+    SSO.chars=SSO.chars.filter(x=>x.charId!==c.charId);
+    saveSSO();renderReadouts();
+    toast('EVE login expired for '+c.charName+' — log in again');return null;
+  }
 }
 async function pullBlueprints(){
-  const tok=await ssoAccess();
-  if(!tok){toast('Log in with EVE first');return;}
-  let page=1,pages=1,n=0;
+  if(!SSO.chars.length){toast('Log in with EVE first');return;}
+  let n=0,chars=0;
   const bp2prod={};
   for(const[pid,r]of Object.entries(RECIPES))bp2prod[r.bp]=+pid;
-  try{
-    while(page<=pages){
-      const r=await fetch(ESI+'/characters/'+SSO.charId+'/blueprints/?page='+page,
-        {headers:{Authorization:'Bearer '+tok}});
-      if(!r.ok)throw new Error('http '+r.status);
-      pages=+(r.headers.get('x-pages')||1);
-      for(const b of await r.json()){
-        const pid=bp2prod[b.type_id];
-        if(pid==null||b.material_efficiency==null)continue;
-        if(S.me[pid]==null||b.material_efficiency>S.me[pid]){S.me[pid]=b.material_efficiency;n++;}
-        if(b.time_efficiency!=null&&(S.te[pid]==null||b.time_efficiency>S.te[pid]))S.te[pid]=b.time_efficiency;
+  for(const c of [...SSO.chars]){
+    const tok=await ssoAccess(c); if(!tok)continue;
+    try{
+      let page=1,pages=1;
+      while(page<=pages){
+        const r=await fetch(ESI+'/characters/'+c.charId+'/blueprints/?page='+page,
+          {headers:{Authorization:'Bearer '+tok}});
+        if(!r.ok)throw new Error('http '+r.status);
+        pages=+(r.headers.get('x-pages')||1);
+        for(const b of await r.json()){
+          const pid=bp2prod[b.type_id];
+          if(pid==null||b.material_efficiency==null)continue;
+          if(S.me[pid]==null||b.material_efficiency>S.me[pid]){S.me[pid]=b.material_efficiency;n++;}
+          if(b.time_efficiency!=null&&(S.te[pid]==null||b.time_efficiency>S.te[pid]))S.te[pid]=b.time_efficiency;
+        }
+        page++;
       }
-      page++;
-    }
-    toast('Applied ME from '+n+' of your blueprints');
-    save();render();
-  }catch(e){toast('Blueprint fetch failed: '+e.message);}
+      chars++;
+    }catch(e){toast(c.charName+': blueprint fetch failed: '+e.message);}
+  }
+  if(chars)toast('Applied ME from '+n+' blueprints across '+chars+' character'+(chars>1?'s':''));
+  save();render();
 }
 async function pullSkills(){
-  const tok=await ssoAccess();
-  if(!tok){toast('Log in with EVE first');return;}
-  try{
-    const r=await fetch(ESI+'/characters/'+SSO.charId+'/skills/',
-      {headers:{Authorization:'Bearer '+tok}});
-    if(!r.ok)throw new Error('http '+r.status+(r.status===403?' — add the esi-skills.read_skills.v1 scope to your ESI app and log in again':''));
-    const j=await r.json();
-    S.skills={};
-    for(const s of j.skills)S.skills[s.skill_id]=s.active_skill_level;
-    const sl=slots();
-    toast('Skills synced — '+sl.m+' mfg / '+sl.r+' reaction slots, times and invention odds updated');
-    save();render();
-  }catch(e){toast('Skill fetch failed: '+e.message);}
+  if(!SSO.chars.length){toast('Log in with EVE first');return;}
+  for(const c of [...SSO.chars]){
+    const tok=await ssoAccess(c); if(!tok)continue;
+    try{
+      const r=await fetch(ESI+'/characters/'+c.charId+'/skills/',
+        {headers:{Authorization:'Bearer '+tok}});
+      if(!r.ok)throw new Error('http '+r.status+(r.status===403?' — add the esi-skills.read_skills.v1 scope to your ESI app and log in again':''));
+      const j=await r.json();
+      c.skills={};
+      for(const s of j.skills)c.skills[s.skill_id]=s.active_skill_level;
+    }catch(e){toast(c.charName+': skill fetch failed: '+e.message);}
+  }
+  saveSSO();
+  const sl=slots();
+  toast('Skills synced — '+sl.m+' mfg / '+sl.r+' reaction slots across '+SSO.chars.length+' character'+(SSO.chars.length>1?'s':''));
+  save();render();
 }
 async function pullLocation(){
-  const tok=await ssoAccess(); if(!tok)return;
-  try{
-    const r=await fetch(ESI+'/characters/'+SSO.charId+'/location/',{headers:{Authorization:'Bearer '+tok}});
-    if(!r.ok)return;
-    const j=await r.json();
-    const s=await fetch(ESI+'/universe/systems/'+j.solar_system_id+'/');
-    if(s.ok){SSO.sys=(await s.json()).name;saveSSO();renderReadouts();}
-  }catch(e){}
+  for(const c of [...SSO.chars]){
+    const tok=await ssoAccess(c); if(!tok)continue;
+    try{
+      const r=await fetch(ESI+'/characters/'+c.charId+'/location/',{headers:{Authorization:'Bearer '+tok}});
+      if(!r.ok)continue;
+      const j=await r.json();
+      const s=await fetch(ESI+'/universe/systems/'+j.solar_system_id+'/');
+      if(s.ok)c.sys=(await s.json()).name;
+    }catch(e){}
+  }
+  saveSSO();renderReadouts();
+}
+async function pullJobs(){
+  if(!SSO.chars.length){toast('Log in with EVE first');return;}
+  for(const c of [...SSO.chars]){
+    const tok=await ssoAccess(c); if(!tok)continue;
+    try{
+      const r=await fetch(ESI+'/characters/'+c.charId+'/industry/jobs/',
+        {headers:{Authorization:'Bearer '+tok}});
+      if(!r.ok)throw new Error('http '+r.status+(r.status===403?' — add the esi-industry.read_character_jobs.v1 scope to your ESI app and log in again':''));
+      JOBS[c.charId]={ts:Date.now(),jobs:await r.json()};
+    }catch(e){toast(c.charName+': job fetch failed: '+e.message);}
+  }
+  render();
 }
 async function pullAssets(){
-  const tok=await ssoAccess();
-  if(!tok){toast('Log in with EVE first');return;}
+  if(!SSO.chars.length){toast('Log in with EVE first');return;}
   const plan=computePlan();
   const wanted=new Set([...plan.shop.keys(),...plan.gross.keys()].map(Number));
   if(!wanted.size){toast('Add a build target first — assets are matched against the plan');return;}
-  try{
-    let page=1,pages=1;
-    const agg={};
-    while(page<=pages){
-      const r=await fetch(ESI+'/characters/'+SSO.charId+'/assets/?page='+page,
-        {headers:{Authorization:'Bearer '+tok}});
-      if(!r.ok)throw new Error('http '+r.status);
-      pages=+(r.headers.get('x-pages')||1);
-      for(const a of await r.json()){
-        if(!wanted.has(a.type_id))continue;
-        const f=a.location_flag||'';
-        if(f.includes('Hangar')||f==='Deliveries'||f==='Unlocked')
-          agg[a.type_id]=(agg[a.type_id]||0)+(a.quantity||1);
+  const agg={};
+  let okChars=0;
+  for(const c of [...SSO.chars]){
+    const tok=await ssoAccess(c); if(!tok)continue;
+    try{
+      let page=1,pages=1;
+      while(page<=pages){
+        const r=await fetch(ESI+'/characters/'+c.charId+'/assets/?page='+page,
+          {headers:{Authorization:'Bearer '+tok}});
+        if(!r.ok)throw new Error('http '+r.status);
+        pages=+(r.headers.get('x-pages')||1);
+        for(const a of await r.json()){
+          if(!wanted.has(a.type_id))continue;
+          const f=a.location_flag||'';
+          if(f.includes('Hangar')||f==='Deliveries'||f==='Unlocked')
+            agg[a.type_id]=(agg[a.type_id]||0)+(a.quantity||1);
+        }
+        page++;
       }
-      page++;
+      okChars++;
+    }catch(e){toast(c.charName+': asset fetch failed: '+e.message);}
+  }
+  let n=0;
+  for(const[tid,q]of Object.entries(agg)){S.stock[tid]=q;n++;}
+  toast(n?('Stock set from assets of '+okChars+' character'+(okChars>1?'s':'')+': '+n+' material types'):'No plan materials found in your hangars');
+  save();render();
+}
+/* ---------- job install costs ---------- */
+async function fetchCostData(){
+  try{
+    const ids=new Set(planTypeIds());
+    if(ids.size){
+      const r=await fetch(ESI+'/markets/prices/');
+      if(r.ok){
+        S.adj={};
+        for(const e of await r.json())
+          if(ids.has(e.type_id)&&e.adjusted_price!=null)S.adj[e.type_id]=e.adjusted_price;
+      }
     }
-    let n=0;
-    for(const[tid,q]of Object.entries(agg)){S.stock[tid]=q;n++;}
-    toast(n?('Stock set from assets: '+n+' material types'):'No plan materials found in your hangars');
-    save();render();
-  }catch(e){toast('Asset fetch failed: '+e.message);}
+    const sys=(S.set.sciSys||'').trim();
+    if(sys){
+      const ir=await fetch(ESI+'/universe/ids/',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify([sys])});
+      const sysId=ir.ok?(((await ir.json()).systems||[])[0]||{}).id:null;
+      if(sysId){
+        const sr=await fetch(ESI+'/industry/systems/');
+        if(sr.ok){
+          const row=(await sr.json()).find(x=>x.solar_system_id===sysId);
+          if(row){
+            for(const ci of row.cost_indices){
+              if(ci.activity==='manufacturing')S.set.sciM=ci.cost_index;
+              if(ci.activity==='reaction')S.set.sciR=ci.cost_index;
+            }
+          }
+        }
+      }else toast('System "'+sys+'" not found');
+    }
+    save();
+  }catch(e){}
+}
+function installCost(step){
+  const r=RECIPES[step.tid];
+  if(!r||!Object.keys(S.adj).length)return null;
+  let eiv=0;
+  for(const [mid,q] of r.mats)eiv+=(S.adj[mid]||0)*q;
+  eiv*=step.runs;
+  const sci=r.act==='r'?(S.set.sciR||0):(S.set.sciM||0);
+  return eiv*(sci*(1-(S.set.costBonus||0)/100)+(S.set.tax||0)/100+(S.set.scc??4)/100);
 }
 async function fetchStructMarket(){
   const sid=String(S.set.structId||'').trim();
@@ -307,7 +395,7 @@ async function fetchStructMarket(){
   }catch(e){toast('Structure market fetch failed: '+e.message);}
   fetchingPrices=false;renderReadouts();
 }
-function ssoLogout(){SSO=null;saveSSO();renderReadouts();render();toast('Logged out');}
+function ssoLogout(){SSO={chars:[]};JOBS={};saveSSO();renderReadouts();render();toast('Logged out');}
 
 /* ---------- core calculation (ported, headless-tested) ---------- */
 function meFor(tid){
@@ -425,14 +513,14 @@ function renderReadouts(){
   r.innerHTML=
     `<span>${Object.keys(RECIPES).length||'…'} recipes</span>`+
     `<span>${pdot} jita ${fetchingPrices?'updating…':ago(S.priceTs)} <button id="priceBtn">refresh</button></span>`+
-    `<span>${SSO?`<span class="dot">●</span> ${esc(SSO.charName)}${SSO.sys?' @ '+esc(SSO.sys):''} <button id="bpBtn">sync</button> <button id="outBtn">logout</button>`
+    `<span>${SSO.chars.length?`<span class="dot">●</span> ${esc(SSO.chars[0].charName)}${SSO.chars.length>1?' +'+(SSO.chars.length-1):''}${SSO.chars[0].sys?' @ '+esc(SSO.chars[0].sys):''} <button id="bpBtn">sync</button> <button id="outBtn">logout</button>`
                :`<span class="dot off">●</span> not logged in <button id="inBtn">EVE login</button>`}</span>`+
-    (Object.keys(S.skills).length?`<span title="from your Mass Production / Reactions / Laboratory skills">⚒ <b>${slots().m}</b> mfg · <b>${slots().r}</b> react · <b>${slots().s}</b> sci slots</span>`:'')+
+    (skilledChars().length?`<span title="summed across your logged-in characters' Mass Production / Reactions / Laboratory skills">⚒ <b>${slots().m}</b> mfg · <b>${slots().r}</b> react · <b>${slots().s}</b> sci slots</span>`:'')+
     `<button id="themeBtn" title="theme">${S.theme==='dark'?'◐ dark':S.theme==='light'?'◑ light':'◓ auto'}</button>`;
   const on=(id,f)=>{const b=$(id);if(b)b.onclick=f;};
   on('priceBtn',()=>refreshPrices(true));
   on('inBtn',ssoLogin); on('outBtn',ssoLogout);
-  on('bpBtn',async()=>{await pullBlueprints();await pullSkills();pullLocation();});
+  on('bpBtn',async()=>{await pullBlueprints();await pullSkills();pullLocation();pullJobs();});
   on('themeBtn',()=>{S.theme=S.theme===''?'dark':S.theme==='dark'?'light':'';
     applyTheme();save();renderReadouts();});
 }
@@ -450,15 +538,58 @@ function pillFor(tid){
   return '';
 }
 function render(){
-  for(const t of ['plan','steps','shop','data'])
+  for(const t of ['plan','steps','shop','jobs','data'])
     $('tab-'+t).setAttribute('aria-selected',String(S.tab===t));
   const P=$('panel');
   if(S.tab==='plan')P.innerHTML=renderPlan();
   else if(S.tab==='steps')P.innerHTML=renderSteps();
   else if(S.tab==='shop')P.innerHTML=renderShop();
+  else if(S.tab==='jobs')P.innerHTML=renderJobs();
   else P.innerHTML=renderData();
   wirePanel();
   if(S.tab==='plan')drawFlows();
+}
+/* ---------- jobs dashboard ---------- */
+const ACT_NAMES={1:'Manufacturing',3:'TE research',4:'ME research',5:'Copying',8:'Invention',9:'Reverse eng.',11:'Reaction'};
+function renderJobs(){
+  if(!SSO.chars.length)
+    return `<div class="empty">Log in with EVE (Prices · Stock · ESI tab) to see your industry jobs across all your characters.</div>`;
+  const now=Date.now();
+  let h=`<div class="note">Running and ready jobs for every logged-in character, with slot usage from their skills. Data refreshes on <b>sync</b> or the button below.</div>
+  <div style="display:flex;gap:8px;margin:4px 0 12px"><button class="ghost" id="jobsRefresh">Refresh jobs</button></div>`;
+  for(const c of SSO.chars){
+    const jd=JOBS[c.charId];
+    const jobs=(jd?jd.jobs:[]).filter(j=>j.status==='active'||j.status==='ready'||j.status==='paused');
+    const used={m:0,r:0,s:0};
+    for(const j of jobs){
+      if(j.activity_id===1)used.m++;
+      else if(j.activity_id===11)used.r++;
+      else used.s++;
+    }
+    const sk=c.skills||{};
+    const cap={m:1+(sk[SK.massProd]||0)+(sk[SK.advMassProd]||0),
+               r:1+(sk[SK.massReact]||0)+(sk[SK.advMassReact]||0),
+               s:1+(sk[SK.labOp]||0)+(sk[SK.advLabOp]||0)};
+    h+=`<div class="sec"><h2>${esc(c.charName)}${c.sys?' · '+esc(c.sys):''} — mfg ${used.m}/${cap.m} · reactions ${used.r}/${cap.r} · science ${used.s}/${cap.s}${jd?'':' · not fetched yet'}</h2>`;
+    if(!jobs.length){h+=`<div class="note">${jd?'No active jobs — all slots free.':'Hit Refresh jobs.'}</div></div>`;continue;}
+    jobs.sort((a,b)=>new Date(a.end_date)-new Date(b.end_date));
+    h+=`<div class="scroller"><table>
+      <tr><th>Activity</th><th colspan="2">Output</th><th class="num">Runs</th><th class="num">Ends</th><th>Status</th></tr>`;
+    for(const j of jobs){
+      const end=new Date(j.end_date).getTime();
+      const left=end-now;
+      const ready=j.status==='ready'||left<=0;
+      h+=`<tr><td>${ACT_NAMES[j.activity_id]||('activity '+j.activity_id)}</td>
+        <td style="width:28px">${icon(j.product_type_id||j.blueprint_type_id)}</td>
+        <td>${esc(tname(j.product_type_id||j.blueprint_type_id))}</td>
+        <td class="num">${fmt(j.runs)}</td>
+        <td class="num">${ready?'—':fmtTime(left/1000)}</td>
+        <td>${ready?'<b style="color:var(--good)">READY</b>':(j.status==='paused'?'<span style="color:var(--warn)">paused</span>':'running')}</td></tr>`;
+    }
+    h+=`</table></div></div>`;
+  }
+  h+=`<div class="note">Needs the <code>esi-industry.read_character_jobs.v1</code> scope on your ESI app. Use <b>Add character</b> on the ESI tab to link alts — slots in the planner sum across everyone.</div>`;
+  return h;
 }
 function renderPlan(){
   if(!S.targets.length)
@@ -592,7 +723,7 @@ function renderSteps(){
   const plan=computePlan();
   if(!plan.steps.length)return '<div class="empty">Nothing to build yet — add a target, or everything is covered by stock.</div>';
   const maxd=Math.max(...plan.steps.map(s=>s.depth));
-  const sl=slots(), haveSkills=Object.keys(S.skills).length>0;
+  const sl=slots(), haveSkills=skilledChars().length>0;
   // wall-clock: longest-processing-time packing of each tier's jobs into your slots
   const makespan=(times,n)=>{ if(!times.length)return 0;
     const heap=Array(Math.max(1,n)).fill(0);
@@ -616,6 +747,7 @@ function renderSteps(){
       const lab=tcat(tid)==='Planetary Commodities'?'Planetary commodities (PI)':(tgroup(tid)||'Other');
       (groupsOf[lab]??=[]).push({tid:+tid,q});
     }
+    T0G=groupsOf;
     const pref=['Mineral','Moon Materials','Ice Product','Planetary commodities (PI)','Fuel Block','Salvaged Materials','Datacores'];
     const labs=Object.keys(groupsOf).sort((a,b)=>{
       const ia=pref.indexOf(a),ib=pref.indexOf(b);
@@ -627,7 +759,8 @@ function renderSteps(){
       let gq=0,gv=0,gt=0,priced=true;
       for(const r of rows){const p=price(r.tid).s;gv+=(TYPES[r.tid]&&TYPES[r.tid].v||0)*r.q;
         if(p!=null)gt+=p*r.q;else priced=false;}
-      h+=`<tr class="stepdepth"><td colspan="2">${esc(lab)} · ${rows.length} type${rows.length>1?'s':''}</td>
+      h+=`<tr class="stepdepth"><td colspan="2">${esc(lab)} · ${rows.length} type${rows.length>1?'s':''}
+        <button class="tiny quiet" data-copygrp="${esc(lab)}">copy multibuy</button></td>
         <td></td><td class="num">${fmt(gv,0)}</td><td class="num">${fmtISK(gt)}${priced?'':' +?'}</td></tr>`;
       for(const r of rows){
         const p=price(r.tid).s;
@@ -639,8 +772,8 @@ function renderSteps(){
     h+=`</table></div><div class="note">Everything the plan consumes but does not build — gather or buy this before tier 1 starts. PI commodities are totals only; their planet-side chains are deliberately not expanded.</div></div>`;
   }
   h+=`<div class="scroller"><table>
-  <tr><th></th><th colspan="2">Product</th><th></th><th class="num">Units</th><th class="num">Runs</th><th class="num">ME / TE</th><th class="num">Job time</th><th>Blueprint</th></tr>`;
-  let lastTier=null,totalTime=0;
+  <tr><th></th><th colspan="2">Product</th><th></th><th class="num">Units</th><th class="num">Runs</th><th class="num">ME / TE</th><th class="num">Job time</th><th class="num">Install</th><th>Blueprint</th></tr>`;
+  let lastTier=null,totalTime=0,totalInstall=0,anyInstall=false;
   for(const s of plan.steps){
     const tier=maxd-s.depth;
     if(tier!==lastTier){
@@ -650,7 +783,7 @@ function renderSteps(){
                         makespan(g.filter(x=>x.act==='r').map(x=>x.time),sl.r));
       const slotTxt=[mJ?`${mJ} mfg job${mJ>1?'s':''} on ${sl.m} slot${sl.m>1?'s':''}`:'',
                      rJ?`${rJ} reaction job${rJ>1?'s':''} on ${sl.r} slot${sl.r>1?'s':''}`:''].filter(Boolean).join(' · ');
-      h+=`<tr class="stepdepth"><td colspan="9">Tier ${tier+1} — ${s.depth===0?'final products':(s.act==='r'?'reactions / intermediates':'intermediates')} · ${slotTxt} · wall-clock ≈ ${fmtTime(tw)}</td></tr>`;
+      h+=`<tr class="stepdepth"><td colspan="10">Tier ${tier+1} — ${s.depth===0?'final products':(s.act==='r'?'reactions / intermediates':'intermediates')} · ${slotTxt} · wall-clock ≈ ${fmtTime(tw)}</td></tr>`;
       lastTier=tier;
     }
     totalTime+=s.time;
@@ -662,7 +795,10 @@ function renderSteps(){
       <td style="width:28px">${icon(s.tid)}</td><td>${esc(tname(s.tid))}</td><td>${pillFor(s.tid)}</td>
       <td class="num">${fmt(s.net)}</td><td class="num">${fmt(s.runs)}</td>
       <td class="num"${meSrc}>${meTxt}${S.me[s.tid]!=null?' <span class="src">yours</span>':''}</td>
-      <td class="num">${fmtTime(s.time)}</td>
+      <td class="num">${fmtTime(s.time)}</td>`;
+    const ic=installCost(s);
+    if(ic!=null){totalInstall+=ic;anyInstall=true;}
+    h+=`<td class="num">${ic!=null?fmtISK(ic):'—'}</td>
       <td class="meta" style="color:var(--fg2);font-size:12px">${esc(tname(r.bp))}</td></tr>`;
     if(open){
       for(const [mid,q] of jobMats(s.tid,s.runs)){
@@ -671,11 +807,12 @@ function renderSteps(){
           <td style="padding-left:16px">${esc(tname(mid))}</td>
           <td><span class="pill">${built?'built below':'buy'}</span></td>
           <td class="num">${fmt(q)}</td><td></td><td></td>
-          <td class="num">${ps!=null?fmtISK(ps*q):''}</td><td></td></tr>`;
+          <td class="num">${ps!=null?fmtISK(ps*q):''}</td><td></td><td></td></tr>`;
       }
     }
   }
-  h+=`<tr class="total"><td colspan="7">Job time: sequential total / wall-clock with your slots</td><td class="num">${fmtTime(totalTime)} / ≈${fmtTime(wall)}</td><td></td></tr></table></div>`;
+  h+=`<tr class="total"><td colspan="7">Job time: sequential / wall-clock · total install</td><td class="num">${fmtTime(totalTime)} / ≈${fmtTime(wall)}</td><td class="num">${anyInstall?fmtISK(totalInstall):'—'}</td><td></td></tr></table></div>`;
+  if(!anyInstall)h+=`<div class="note">Install costs show once prices have refreshed (ESI adjusted prices) — set your build system on the Prices · Stock · ESI tab for the real system cost index, or they assume 0% SCI.</div>`;
   if(plan.invRows.length){
     h+=`<div class="sec"><h2>Invention</h2><div class="scroller"><table>
     <tr><th>For</th><th class="num">Runs needed</th><th class="num">Prob.</th><th class="num">Runs/BPC</th><th class="num">Expected attempts</th><th>Per attempt</th><th>Source</th></tr>`;
@@ -686,7 +823,7 @@ function renderSteps(){
       <td class="meta" style="color:var(--fg2);font-size:12px">${r.iv.mats.map(([m,q])=>q+'× '+esc(tname(m))).join(', ')}</td>
       <td class="meta" style="color:var(--fg2);font-size:12px">${esc(tname(r.iv.from))}${tcat(r.iv.from)==='Ancient Relics'?' (consumed)':''}</td></tr>`;
     }
-    h+=`</table></div><div class="note">${Object.keys(S.skills).length?'Probabilities include your encryption and science skills; decryptors not applied.':'Base probability — log in with EVE to apply your skills; decryptors not applied.'} Datacores (and relics) for the expected attempts are already in the shopping list.</div></div>`;
+    h+=`</table></div><div class="note">${skilledChars().length?'Probabilities include your best encryption and science skills; decryptors not applied.':'Base probability — log in with EVE to apply your skills; decryptors not applied.'} Datacores (and relics) for the expected attempts are already in the shopping list.</div></div>`;
   }
   if(plan.stockUsed.size){
     h+=`<div class="sec"><h2>Covered from stock</h2><table><tr><th>Item</th><th class="num">Used</th></tr>`;
@@ -726,12 +863,19 @@ function renderShop(){
       <td class="num">${fmtISK(ts)}</td><td class="num">${fmtISK(tb)}</td><td></td></tr></table></div>`;
   let sellV=0,ok=true;
   for(const t of S.targets){const p=price(t.tid).s; if(p==null){ok=false;break;} sellV+=p*t.qty;}
+  let inst=0,anyInst=false;
+  for(const s of plan.steps){const c=installCost(s);if(c!=null){inst+=c;anyInst=true;}}
+  const marg=sellV-ts-(anyInst?inst:0);
   h=`<div class="kpis">
     <div class="kpi"><div class="l">Material cost @ sell</div><div class="v">${fmtISK(ts)}</div></div>
     <div class="kpi"><div class="l">Material cost @ buy</div><div class="v">${fmtISK(tb)}</div></div>
+    <div class="kpi"><div class="l">Job installs${S.set.sciSys?' @ '+esc(S.set.sciSys):''}</div><div class="v">${anyInst?fmtISK(inst):'—'}</div></div>
     <div class="kpi"><div class="l">Haul volume</div><div class="v">${fmt(tv,0)} m³</div></div>
     <div class="kpi"><div class="l">Product sell value</div><div class="v">${ok?fmtISK(sellV):'—'}</div></div>
-    <div class="kpi"><div class="l">Margin (sell − mat@sell)</div><div class="v ${ok&&sellV-ts>=0?'good':'bad'}">${ok?fmtISK(sellV-ts):'—'}</div></div>
+    <div class="kpi"><div class="l">Margin (sell − mats − installs)</div><div class="v ${ok&&marg>=0?'good':'bad'}">${ok?fmtISK(marg):'—'}</div></div>
+  </div>
+  <div style="display:flex;gap:8px;margin:10px 0;flex-wrap:wrap">
+    <button class="ghost" id="copyAllMb">Copy multibuy — everything</button>
   </div>`+
   `<div class="sec"><h2>Top cost drivers</h2><div class="scroller"><table>
     <tr><th colspan="2">Material</th><th class="num">Qty</th><th class="num">Unit (src)</th><th class="num">Total</th><th class="num">% of mat cost</th></tr>
@@ -758,7 +902,7 @@ function renderData(){
           <option value="ext"${S.set.basis==='ext'?' selected':''}>Best order (min sell / max buy)</option>
           <option value="avg"${S.set.basis==='avg'?' selected':''}>Weighted average of whole book</option>
         </select></label>
-      ${SSO?`<div class="note"><b>Structure market</b> — price the plan against a player structure you can dock in (overrides Jita for types it stocks):</div>
+      ${SSO.chars.length?`<div class="note"><b>Structure market</b> — price the plan against a player structure you can dock in (overrides Jita for types it stocks):</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <input type="text" id="structId" class="price-in" style="width:170px !important;text-align:left" placeholder="structure ID" value="${esc(S.set.structId||'')}">
         <button class="ghost" id="structFetch">Fetch structure prices</button>
@@ -779,17 +923,30 @@ function renderData(){
       — type <b>Authentication &amp; API access</b>, callback URL exactly <code id="cbUrl"></code>, with these scopes:
       <code>esi-characters.read_blueprints.v1</code>, <code>esi-skills.read_skills.v1</code>,
       <code>esi-assets.read_assets.v1</code>, <code>esi-location.read_location.v1</code>,
-      <code>esi-universe.read_structures.v1</code>, <code>esi-markets.structure_markets.v1</code>
+      <code>esi-universe.read_structures.v1</code>, <code>esi-markets.structure_markets.v1</code>,
+      <code>esi-industry.read_character_jobs.v1</code>
       — then paste its Client ID here. Tokens live only in this browser.
       If the EVE login page shows a scope error, your app is missing one of the scopes above — add it and retry.</div>
       <label class="f" style="color:var(--fg2)">ESI application client ID
         <input type="text" id="clientId" style="max-width:420px" value="${esc(S.set.clientId||'')}" placeholder="e.g. 0a1b2c3d4e5f…"></label>
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-        ${SSO?`<button id="bpImport2">Sync blueprints (${esc(SSO.charName)})</button><button class="quiet" id="outBtn2">Log out</button>`
+        ${SSO.chars.length?`<button id="bpImport2">Sync all (${SSO.chars.map(c=>esc(c.charName)).join(', ')})</button><button class="ghost" id="addChar">Add character</button><button class="quiet" id="outBtn2">Log out all</button>`
              :`<button id="loginBtn">Log in with EVE Online</button>`}
         <button class="quiet" id="meClear">Reset ME overrides</button>
-        <span class="note">${Object.keys(S.me).length} ME overrides · ${Object.keys(S.skills).length?Object.keys(S.skills).length+' skills synced ('+slots().m+' mfg / '+slots().r+' reaction / '+slots().s+' science slots)':'skills not synced'}</span>
+        <span class="note">${Object.keys(S.me).length} ME overrides · ${skilledChars().length?skilledChars().length+' character'+(skilledChars().length>1?'s':'')+' synced ('+slots().m+' mfg / '+slots().r+' reaction / '+slots().s+' science slots total)':'skills not synced'}</span>
       </div>
+    </div>
+  </div>
+  <div class="sec">
+    <h2>Job install costs</h2>
+    <div class="note">The in-game formula: estimated item value × system cost index × (1 − structure bonus) + facility tax + SCC surcharge. Adjusted prices come from ESI with every price refresh; set your build system to pull its live cost indices.</div>
+    <div class="toolbar" style="padding:6px 0">
+      <label class="f" style="color:var(--fg2)">Build system<input type="text" id="sciSys" value="${esc(S.set.sciSys||'')}" placeholder="e.g. Sakenta" style="width:150px"></label>
+      <button class="ghost" id="sciFetch">Update indices</button>
+      <span class="note">mfg SCI <b>${((S.set.sciM||0)*100).toFixed(2)}%</b> · reaction SCI <b>${((S.set.sciR||0)*100).toFixed(2)}%</b></span>
+      <label class="f" style="color:var(--fg2)">Facility tax %<input type="number" id="taxIn" value="${S.set.tax??1}" min="0" max="20" step="0.05"></label>
+      <label class="f" style="color:var(--fg2)">Cost bonus %<input type="number" id="costBonusIn" value="${S.set.costBonus??0}" min="0" max="10" step="0.5"></label>
+      <label class="f" style="color:var(--fg2)">SCC %<input type="number" id="sccIn" value="${S.set.scc??4}" min="0" max="10" step="0.5"></label>
     </div>
   </div>
   <div class="sec">
@@ -802,9 +959,14 @@ function renderData(){
       </div>
       <label class="f" style="color:var(--fg2)">Qty<input type="number" id="stockQty" value="1" min="1"></label>
       <button class="ghost" id="stockAdd">Add to stock</button>
-      ${SSO?'<button class="ghost" id="assetPull">Import from assets</button>':''}
+      ${SSO.chars.length?'<button class="ghost" id="assetPull">Import from assets</button>':''}
       <button class="quiet" id="stockClear">Clear stock</button>
     </div>
+    <details class="helpbox"><summary>Paste from the game</summary>
+      <div class="note">Paste a copied inventory (select items in a hangar, Ctrl+A Ctrl+C), a contract's item list, or plain <code>name qty</code> lines — quantities merge into stock.</div>
+      <textarea id="stockPaste" placeholder="Tritanium&#9;540,556&#10;Fullerides&#9;6,468"></textarea>
+      <div style="margin-top:6px"><button class="ghost" id="stockPasteBtn">Import paste into stock</button></div>
+    </details>
     ${stockRows.length?`<div class="scroller"><table><tr><th colspan="2">Item</th><th class="num">On hand</th><th class="num">Used by plan</th><th></th></tr>${
       stockRows.map(([tid,q])=>`<tr><td style="width:28px">${icon(tid)}</td><td>${esc(tname(tid))}</td>
         <td class="num"><input type="text" class="price-in" data-stockq="${tid}" value="${q}"></td>
@@ -864,6 +1026,40 @@ function attachSearch(inputId,sugsId,universe,onPick){
   document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==inp)box.hidden=true;});
 }
 
+/* ---------- clipboard interop ---------- */
+function copyText(txt,what){
+  navigator.clipboard.writeText(txt)
+    .then(()=>toast('Copied '+what+' — paste into the in-game multibuy window'))
+    .catch(()=>toast('Clipboard blocked by the browser — try again after clicking the page'));
+}
+function multibuyLines(rows){ // [[tid,qty],...] -> in-game multibuy format
+  return rows.map(([tid,q])=>tname(tid)+'\t'+Math.ceil(q)).join('\n');
+}
+function parseStockPaste(text){
+  let n=0;
+  for(let line of text.split(/\n/)){
+    line=line.trim(); if(!line)continue;
+    let name=null,qty=null;
+    const parts=line.split('\t');
+    if(parts.length>=2){
+      name=parts[0].trim();
+      const q=parseFloat(parts[1].replace(/[\s, *]/g,''));
+      if(!isNaN(q))qty=q;
+    }
+    if(name==null||qty==null){
+      const m=line.match(/^(.+?)[\s]+[x×]?\s*([\d., ]+)$/);
+      if(m){name=m[1].trim();const q=parseFloat(m[2].replace(/[\s, ]/g,''));if(!isNaN(q))qty=q;}
+    }
+    if(name==null){name=line;qty=1;}
+    if(qty==null)qty=1;
+    const tid=NAME2ID[name.toLowerCase()];
+    if(!tid)continue;
+    S.stock[tid]=(S.stock[tid]||0)+qty;n++;
+  }
+  return n;
+}
+let T0G={}; // last-rendered Tier 0 groups: label -> [{tid,q}]
+
 /* ---------- manual imports ---------- */
 function importPrices(text){
   text=text.trim(); if(!text)return 0;
@@ -906,6 +1102,19 @@ function wirePanel(){
     if(bb){const tid=bb.dataset.bb;if(S.buy[tid])delete S.buy[tid];else S.buy[tid]=1;render();save();refreshPrices();return;}
     const del=e.target.closest('[data-del]');
     if(del){S.targets.splice(+del.dataset.del,1);render();save();return;}
+    const cg=e.target.closest('[data-copygrp]');
+    if(cg){const g=T0G[cg.dataset.copygrp]||[];
+      copyText(multibuyLines(g.map(r=>[r.tid,r.q])),cg.dataset.copygrp);return;}
+    if(e.target.id==='copyAllMb'){
+      const plan=computePlan();
+      copyText(multibuyLines([...plan.shop.entries()]),'full shopping list');return;}
+    if(e.target.id==='stockPasteBtn'){
+      const n=parseStockPaste($('stockPaste').value);
+      toast(n?('Merged '+n+' line'+(n>1?'s':'')+' into stock'):'Nothing recognized — names must match in-game items');
+      if(n){save();render();}return;}
+    if(e.target.id==='sciFetch'){fetchCostData().then(()=>{toast('Cost indices updated');render();});return;}
+    if(e.target.id==='jobsRefresh'){pullJobs();return;}
+    if(e.target.id==='addChar'){ssoLogin();return;}
     const bi=e.target.closest('[data-buildit]');
     if(bi){delete S.buy[bi.dataset.buildit];render();save();refreshPrices();return;}
     const sa=e.target.closest('[data-stockadd]');
@@ -939,6 +1148,10 @@ function wirePanel(){
     else if(t.id==='clientId'){S.set.clientId=t.value.trim();save();}
     else if(t.id==='structId'){S.set.structId=t.value.trim();S.set.structName='';save();}
     else if(t.id==='basisSel'){S.set.basis=t.value;save();render();}
+    else if(t.id==='sciSys'){S.set.sciSys=t.value.trim();save();}
+    else if(t.id==='taxIn'){S.set.tax=parseFloat(t.value)||0;save();render();}
+    else if(t.id==='costBonusIn'){S.set.costBonus=parseFloat(t.value)||0;save();render();}
+    else if(t.id==='sccIn'){S.set.scc=parseFloat(t.value)||0;save();render();}
     else if(t.dataset.alt!=null){
       const tid=t.dataset.alt, bp=+t.value;
       if(BASE_RECIPES[tid]&&BASE_RECIPES[tid].bp===bp)delete S.rchoice[tid];
@@ -964,8 +1177,12 @@ function wireTop(){
     wireTop._pick=null;$('search').value='';S.tab='plan';render();save();
     refreshPrices();
   };
-  for(const t of ['plan','steps','shop','data'])
-    $('tab-'+t).onclick=()=>{S.tab=t;render();save();};
+  for(const t of ['plan','steps','shop','jobs','data'])
+    $('tab-'+t).onclick=()=>{S.tab=t;render();save();
+      if(t==='jobs'&&SSO.chars.length){
+        const stale=SSO.chars.some(c=>!JOBS[c.charId]||Date.now()-JOBS[c.charId].ts>5*60000);
+        if(stale)pullJobs();
+      }};
   const bind=(id,key,isBool)=>{const el=$(id);
     if(isBool)el.checked=!!S.set[key]; else el.value=S.set[key];
     el.onchange=()=>{S.set[key]=isBool?el.checked:(parseFloat(el.value)||0);render();save();};};
@@ -975,7 +1192,9 @@ function wireTop(){
 /* ---------- boot ---------- */
 (async function(){
   try{const raw=localStorage.getItem(LSKEY);if(raw)S=Object.assign(S,JSON.parse(raw));}catch(e){}
-  try{const raw=localStorage.getItem(SSOKEY);if(raw)SSO=JSON.parse(raw);}catch(e){}
+  try{const raw=localStorage.getItem(SSOKEY);
+    if(raw){const p=JSON.parse(raw);
+      SSO=p&&p.chars?p:(p&&p.access?{chars:[p]}:{chars:[]});}}catch(e){}
   applyTheme();
   renderReadouts();
   try{
